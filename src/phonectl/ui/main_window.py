@@ -105,7 +105,9 @@ class _ViewController:
         def call(*args, **kwargs):
             coordinate_actions = {"touch_down", "touch_move", "touch_up", "scroll"}
             if not self._group.sync_enabled:
+                self._group.record_call(name, args, kwargs)
                 return getattr(self._session.controller, name)(*args, **kwargs)
+            self._group.record_call(name, args, kwargs)
             targets = self._group.sessions if name in coordinate_actions else []
             if not targets:
                 return getattr(self._group.broadcast_controller, name)(*args, **kwargs)
@@ -141,6 +143,7 @@ class _SessionGroup:
         self.controllers = {s.serial: s.controller for s in sessions if s.controller is not None}
         self.broadcast_controller = _BroadcastController(sessions)
         self._controller_override = None
+        self._recorder: Recorder | None = None
 
     @property
     def controller(self):
@@ -153,6 +156,10 @@ class _SessionGroup:
     @controller.setter
     def controller(self, value):
         self._controller_override = value
+
+    def record_call(self, name: str, args: tuple, kwargs: dict) -> None:
+        if self._recorder is not None:
+            self._recorder.record(name, args, kwargs)
 
     @property
     def latest_frame(self):
@@ -181,6 +188,14 @@ class _SessionGroup:
             session for session in self.sessions if session.serial == self.active_serial
         )]
         errors = []
+        source_width, source_height = source_size
+        source_delta = round(source_height * 0.325) * direction
+        self.record_call(
+            "swipe",
+            (source_width // 2, source_height // 2 + source_delta,
+             source_width // 2, source_height // 2 - source_delta),
+            {"duration": 0.25},
+        )
         for target in targets:
             size = target.screen_size
             if size is None:
@@ -223,7 +238,6 @@ class MainWindow(QMainWindow):
         self._control_buttons: list[QPushButton] = []
         self._script_runner: ScriptRunner | None = None
         self._recorder: Recorder | None = None
-        self._recording_controller = None
         self._replay_stop = threading.Event()
         self._replay_thread: threading.Thread | None = None
         self._fps_frames = 0
@@ -466,14 +480,12 @@ class MainWindow(QMainWindow):
             return
         if self._recorder is None:
             self._recorder = Recorder()
-            self._recording_controller = self._session.controller
             self._recorder.start()
-            self._session.controller = RecordingController(self._recording_controller, self._recorder)
-            self._append_script_log("开始录制：鼠标和工具栏操作将写入宏")
+            self._session._recorder = self._recorder
+            self._append_script_log("开始录制：鼠标、键盘和工具栏操作将写入宏")
         else:
             recorder, self._recorder = self._recorder, None
-            self._session.controller = self._recording_controller
-            self._recording_controller = None
+            self._session._recorder = None
             macro = recorder.stop()
             out_dir = config.PROJECT_ROOT / "macros"
             name = time.strftime("macro_%Y%m%d_%H%M%S.json")
@@ -493,7 +505,10 @@ class MainWindow(QMainWindow):
             self._append_script_log(f"宏文件无效：{exc}")
             return
         self._replay_stop.clear()
-        controller = self._session.controller
+        controller = self._target_controller()
+        if controller is None:
+            self.set_status("未连接或未选择设备")
+            return
         self._replay_thread = threading.Thread(
             target=self._replay_macro, args=(macro, controller), name="macro-replay", daemon=True
         )
@@ -734,11 +749,15 @@ class MainWindow(QMainWindow):
         if self._session is None:
             return None
         if self.sync_checkbox.isChecked():
-            return getattr(self._session, "broadcast_controller", self._session.controller)
-        controllers = getattr(self._session, "controllers", None)
-        if controllers is None:
-            return self._session.controller
-        return controllers.get(self._active_serial or "", self._session.controller)
+            controller = getattr(self._session, "broadcast_controller", self._session.controller)
+        else:
+            controllers = getattr(self._session, "controllers", None)
+            controller = self._session.controller if controllers is None else controllers.get(
+                self._active_serial or "", self._session.controller
+            )
+        if self._recorder is not None:
+            return RecordingController(controller, self._recorder)
+        return controller
 
     def _send(self, action) -> None:
         controller = self._target_controller()
@@ -811,7 +830,7 @@ class MainWindow(QMainWindow):
         if self._session is not None:
             session = self._session
             if self._recorder is not None:
-                session.controller = self._recording_controller
+                session._recorder = None
                 self._recorder.stop()
                 self._recorder = None
             self._session = None

@@ -131,6 +131,44 @@ def test_broadcast_controller_sends_to_all_devices():
     assert second.controller.calls == ["home"]
 
 
+def test_mirror_view_controller_records_input_for_macro():
+    from phonectl.ui.main_window import _ViewController
+
+    class RecorderStub:
+        def __init__(self):
+            self.calls = []
+
+        def record(self, op, args, kwargs):
+            self.calls.append((op, args, kwargs))
+
+    class ControllerStub:
+        def __init__(self):
+            self.calls = []
+
+        def touch_down(self, x, y):
+            self.calls.append((x, y))
+
+    class SessionStub:
+        serial = "device-1"
+        screen_size = (1080, 2400)
+        controller = ControllerStub()
+
+    class GroupStub:
+        sync_enabled = False
+        sessions = [SessionStub()]
+
+        def __init__(self):
+            self.recorder = RecorderStub()
+
+        def record_call(self, op, args, kwargs):
+            self.recorder.record(op, args, kwargs)
+
+    group = GroupStub()
+    _ViewController(group.sessions[0], group).touch_down(120, 240)
+    assert group.sessions[0].controller.calls == [(120, 240)]
+    assert group.recorder.calls == [("touch_down", (120, 240), {})]
+
+
 def test_main_window_screen_power_buttons_send_matching_commands():
     from PySide6.QtWidgets import QApplication
 
