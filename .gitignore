@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 dist-updated/
+dist-video/
 
 # Runtime output and local automation data
 screenshots/

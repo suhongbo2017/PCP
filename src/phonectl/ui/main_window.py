@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QSpinBox,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -211,6 +212,8 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(POLL_MS)
+        self._page_timer = QTimer(self)
+        self._page_timer.timeout.connect(self.next_video)
         self._update_buttons()
 
     # ---- UI construction -------------------------------------------------
@@ -306,6 +309,20 @@ class MainWindow(QMainWindow):
         add("收起面板", lambda: self._send(lambda c: c.collapse_panels()))
         add("旋转", lambda: self._send(lambda c: c.rotate_device()))
         bar.addSeparator()
+        add("上一条", self.previous_video)
+        add("下一条", self.next_video)
+        self.auto_page_checkbox = QCheckBox("自动翻页")
+        self.auto_page_checkbox.setToolTip("按设定间隔自动执行下一条")
+        self.auto_page_checkbox.toggled.connect(self._set_auto_page)
+        bar.addWidget(self.auto_page_checkbox)
+        self.page_interval = QSpinBox()
+        self.page_interval.setRange(1, 300)
+        self.page_interval.setValue(5)
+        self.page_interval.setSuffix(" 秒")
+        self.page_interval.setToolTip("自动翻页间隔")
+        self.page_interval.valueChanged.connect(self._update_page_timer)
+        bar.addWidget(self.page_interval)
+        bar.addSeparator()
         add("截图", self.save_screenshot)
         add("电脑→手机剪贴板", self.paste_pc_clipboard)
         add("手机→电脑剪贴板", self.fetch_phone_clipboard)
@@ -355,6 +372,26 @@ class MainWindow(QMainWindow):
         self.record_btn.setEnabled(connected and not running and not replaying)
         self.record_btn.setText("停止录制" if recording else "开始录制")
         self.replay_btn.setEnabled(connected and not running and not replaying and not recording)
+
+    def _update_page_timer(self, _value: int = 0) -> None:
+        if self.auto_page_checkbox.isChecked():
+            self._page_timer.setInterval(self.page_interval.value() * 1000)
+
+    def _set_auto_page(self, enabled: bool) -> None:
+        if enabled and self._session is not None:
+            self._page_timer.setInterval(self.page_interval.value() * 1000)
+            self._page_timer.start()
+            self.set_status(f"自动翻页已开启：每 {self.page_interval.value()} 秒下一条")
+        else:
+            self._page_timer.stop()
+            if not enabled:
+                self.set_status("自动翻页已关闭")
+
+    def next_video(self) -> None:
+        self._send(lambda c: c.swipe_up(distance=0.65, duration=0.25))
+
+    def previous_video(self) -> None:
+        self._send(lambda c: c.swipe_down(distance=0.65, duration=0.25))
 
     def choose_script(self) -> None:
         if self._session is None:
@@ -546,6 +583,8 @@ class MainWindow(QMainWindow):
         self.set_status(f"已连接 {len(sessions)} 台设备，当前设备：{sessions[0].info.device_name}；同步操作关闭")
         self._update_buttons()
         self._update_automation_buttons()
+        if self.auto_page_checkbox.isChecked():
+            self._set_auto_page(True)
 
     def _on_connect_failed(self, message: str) -> None:
         self._connecting = False
@@ -561,6 +600,7 @@ class MainWindow(QMainWindow):
         self._session = None
         self._sessions = {}
         self._active_serial = None
+        self._page_timer.stop()
         for view in self._views.values():
             view.attach(None)
         self._views.clear()
@@ -593,6 +633,8 @@ class MainWindow(QMainWindow):
         self.quality_box.setEnabled(not connected and not self._connecting)
         for btn in self._control_buttons:
             btn.setEnabled(connected)
+        self.auto_page_checkbox.setEnabled(connected)
+        self.page_interval.setEnabled(connected)
 
     # ---- frames ----------------------------------------------------------
 
@@ -717,6 +759,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._timer.stop()
+        self._page_timer.stop()
         if self._script_runner is not None:
             self._script_runner.stop()
             self._script_runner.join(2)
