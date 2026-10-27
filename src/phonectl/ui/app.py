@@ -17,5 +17,7 @@ def run_gui(serial: str | None = None, *, auto_connect: bool = False) -> int:
     window = MainWindow(serial=serial)
     window.show()
     if auto_connect and window.device_box.count() == 1:
+        item = window.device_box.item(0)
+        item.setCheckState(Qt.CheckState.Checked)
         QTimer.singleShot(0, window.connect_device)
     return app.exec()

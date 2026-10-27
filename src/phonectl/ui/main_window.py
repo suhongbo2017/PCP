@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
@@ -59,6 +61,54 @@ class _Bridge(QObject):
     replay_done = Signal(str)
 
 
+class _BroadcastController:
+    def __init__(self, sessions: list[ScrcpySession]) -> None:
+        self._controllers = [s.controller for s in sessions if s.controller is not None]
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            result = None
+            errors = []
+            for controller in self._controllers:
+                try:
+                    value = getattr(controller, name)(*args, **kwargs)
+                    if result is None:
+                        result = value
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise ControlError("; ".join(errors))
+            return result
+        return call
+
+
+class _SessionGroup:
+    def __init__(self, sessions: list[ScrcpySession]) -> None:
+        self.sessions = sessions
+        self.primary = sessions[0]
+        self.serial = ",".join(s.serial for s in sessions)
+        self.controller = _BroadcastController(sessions)
+
+    @property
+    def latest_frame(self):
+        return self.primary.latest_frame
+
+    @property
+    def screen_size(self):
+        return self.primary.screen_size
+
+    @property
+    def info(self):
+        return self.primary.info
+
+    def wait_frame(self, timeout=10):
+        return self.primary.wait_frame(timeout)
+
+    def close(self):
+        for session in self.sessions:
+            session.close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, serial: str | None = None) -> None:
         super().__init__()
@@ -68,7 +118,7 @@ class MainWindow(QMainWindow):
         self.move(screen.center() - self.rect().center())  # start fully visible
 
         self._adb = Adb()
-        self._session: ScrcpySession | None = None
+        self._session: _SessionGroup | None = None
         self._connecting = False
         self._last_frame = None
         self._shown_size: tuple[int, int] | None = None
@@ -104,8 +154,9 @@ class MainWindow(QMainWindow):
         top_row = QHBoxLayout(top)
         top_row.setContentsMargins(6, 6, 6, 6)
 
-        self.device_box = QComboBox()
-        self.device_box.setMinimumWidth(200)
+        self.device_box = QListWidget()
+        self.device_box.setMinimumWidth(220)
+        self.device_box.setMaximumHeight(88)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(lambda: self.refresh_devices())
         self.wifi_btn = QPushButton("无线连接")
@@ -117,7 +168,7 @@ class MainWindow(QMainWindow):
         self.connect_btn = QPushButton("连接")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
 
-        top_row.addWidget(QLabel("设备"))
+        top_row.addWidget(QLabel("设备（可多选）"))
         top_row.addWidget(self.device_box, 1)
         top_row.addWidget(self.refresh_btn)
         top_row.addWidget(self.wifi_btn)
@@ -304,8 +355,17 @@ class MainWindow(QMainWindow):
 
     # ---- devices & connection -------------------------------------------
 
+    def selected_serials(self) -> list[str]:
+        return [
+            self.device_box.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.device_box.count())
+            if self.device_box.item(i).checkState() == Qt.CheckState.Checked
+        ]
+
     def refresh_devices(self, preferred: str | None = None) -> None:
-        current = preferred or self.device_box.currentData()
+        selected = set(self.selected_serials())
+        if preferred:
+            selected.add(preferred)
         self.device_box.clear()
         try:
             devices = self._adb.devices()
@@ -316,20 +376,21 @@ class MainWindow(QMainWindow):
             model = dev.props.get("model", "")
             tag = " [无线]" if dev.wireless else ""
             label = f"{model or dev.serial} ({dev.serial}){tag}" + ("" if dev.ready else f" [{dev.state}]")
-            self.device_box.addItem(label, dev.serial)
-        if current is not None:
-            idx = self.device_box.findData(current)
-            if idx >= 0:
-                self.device_box.setCurrentIndex(idx)
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, dev.serial)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if dev.serial in selected else Qt.CheckState.Unchecked)
+            self.device_box.addItem(item)
         if self.device_box.count() == 0:
             self.set_status("没有检测到设备，请检查 USB 调试")
 
     def open_wifi_dialog(self) -> None:
         # Prefer the selected USB device; otherwise any ready USB device.
         usb = None
-        selected = self.device_box.currentData()
-        if selected and not is_wireless_serial(selected):
-            usb = selected
+        selected = self.selected_serials()
+        usb_serial = selected[0] if selected else None
+        if usb_serial and not is_wireless_serial(usb_serial):
+            usb = usb_serial
         else:
             usb = next((d.serial for d in self._adb.devices() if d.ready and not d.wireless), None)
         dlg = WifiDialog(self._adb, usb, self)
@@ -344,12 +405,13 @@ class MainWindow(QMainWindow):
             self.connect_device()
 
     def connect_device(self) -> None:
-        serial = self.device_box.currentData()
-        if not serial or self._connecting:
+        serials = self.selected_serials()
+        if not serials or self._connecting:
             return
-        dev_state = next((d for d in self._adb.devices() if d.serial == serial), None)
-        if dev_state is None or not dev_state.ready:
-            self.set_status("设备未就绪，请检查 USB 调试授权")
+        devices = {d.serial: d for d in self._adb.devices()}
+        invalid = [s for s in serials if s not in devices or not devices[s].ready]
+        if invalid:
+            self.set_status(f"设备未就绪：{', '.join(invalid)}")
             return
 
         max_size = QUALITY_CHOICES[self.quality_box.currentIndex()][1]
@@ -358,27 +420,31 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
         def work() -> None:
-            session = ScrcpySession(serial, adb=self._adb, options=ServerOptions(max_size=max_size))
+            sessions = []
             try:
-                session.start()
-                session.wait_screen_size(timeout=15)
+                for serial in serials:
+                    session = ScrcpySession(serial, adb=self._adb, options=ServerOptions(max_size=max_size))
+                    session.start()
+                    session.wait_screen_size(timeout=15)
+                    sessions.append(session)
             except (ScrcpyError, AdbError, OSError) as exc:
-                session.close()
+                for session in sessions:
+                    session.close()
                 self._bridge.connect_failed.emit(str(exc))
                 return
-            self._bridge.connected.emit(session)
+            self._bridge.connected.emit(sessions)
 
         threading.Thread(target=work, name="connect", daemon=True).start()
 
-    def _on_connected(self, session: ScrcpySession) -> None:
+    def _on_connected(self, sessions: list[ScrcpySession]) -> None:
         self._connecting = False
-        self._session = session
+        self._session = _SessionGroup(sessions)
         self._last_frame = None
         self._shown_size = None
-        self.view.attach(session)
+        self.view.attach(self._session)
         self.view.setFocus()
-        self.setWindowTitle(f"phonectl - {session.info.device_name}")
-        self.set_status(f"已连接：{session.info.device_name}")
+        self.setWindowTitle(f"phonectl - {len(sessions)} 台设备")
+        self.set_status(f"已连接 {len(sessions)} 台设备，操作将广播")
         self._update_buttons()
         self._update_automation_buttons()
 
@@ -390,8 +456,8 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "连接失败", message)
 
     def disconnect_device(self) -> None:
-        session = self._session
-        if session is None:
+        group = self._session
+        if group is None:
             return
         self._session = None
         self.view.attach(None)
@@ -403,7 +469,7 @@ class MainWindow(QMainWindow):
         self._update_automation_buttons()
 
         def work() -> None:
-            session.close()
+            group.close()
             self._bridge.disconnected.emit()
 
         threading.Thread(target=work, name="disconnect", daemon=True).start()
@@ -415,7 +481,7 @@ class MainWindow(QMainWindow):
 
     def _update_buttons(self) -> None:
         connected = self._session is not None
-        self.connect_btn.setText("断开" if connected else "连接")
+        self.connect_btn.setText("断开全部" if connected else "连接选中")
         self.connect_btn.setEnabled(not self._connecting)
         self.device_box.setEnabled(not connected and not self._connecting)
         self.refresh_btn.setEnabled(not connected and not self._connecting)

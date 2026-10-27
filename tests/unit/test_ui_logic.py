@@ -111,6 +111,26 @@ def test_frame_to_qimage_is_detached_from_source():
     assert img.pixelColor(0, 0).red() == 50
 
 
+def test_broadcast_controller_sends_to_all_devices():
+    from phonectl.ui.main_window import _BroadcastController
+
+    class Controller:
+        def __init__(self):
+            self.calls = []
+
+        def home(self):
+            self.calls.append("home")
+
+    class Session:
+        def __init__(self):
+            self.controller = Controller()
+
+    first, second = Session(), Session()
+    _BroadcastController([first, second]).home()
+    assert first.controller.calls == ["home"]
+    assert second.controller.calls == ["home"]
+
+
 def test_main_window_screen_power_buttons_send_matching_commands():
     from PySide6.QtWidgets import QApplication
 
