@@ -46,7 +46,9 @@ def test_session_video_control_and_tap(fake_adb, tmp_path):
         frame = session.wait_frame(timeout=5)
         assert (frame.width, frame.height) == (320, 240)
         assert session.wait_screen_size(timeout=5) == (320, 240)
+        assert session.disconnected is False
         session.controller.tap(10, 20, hold=0)
+    assert session.disconnected is True
 
     # Closing the session closes the control socket; the fake device then writes what it got.
     shell = (state / "shell.txt").read_text()

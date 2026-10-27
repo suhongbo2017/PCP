@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,6 +79,7 @@ class ScrcpySession:
         server_jar: Path = config.SERVER_JAR,
         port: int = config.DEFAULT_PORT,
         connect_timeout: float = 15.0,
+        on_disconnect: Callable[[], None] | None = None,
     ) -> None:
         self.serial = serial
         self.adb = adb or Adb()
@@ -85,6 +87,9 @@ class ScrcpySession:
         self.server_jar = Path(server_jar)
         self.port = port
         self.connect_timeout = connect_timeout
+        self._on_disconnect = on_disconnect
+        self._disconnect_notified = False
+        self._disconnect_lock = threading.Lock()
 
         self.scid: int | None = None
         self.info: StreamInfo | None = None
@@ -161,7 +166,7 @@ class ScrcpySession:
             self._screen_size = self.adb.display_size(self.serial)
 
         self._control_sock = self._accept()
-        self.control = ControlChannel(self._control_sock)
+        self.control = ControlChannel(self._control_sock, on_disconnect=self._notify_disconnect)
         self.control.start()
         self.controller = Controller(self.control, self._require_screen_size)
         log.info("control connected")
@@ -211,6 +216,10 @@ class ScrcpySession:
             return self._latest_frame
 
     @property
+    def disconnected(self) -> bool:
+        return (self.control is not None and self.control.closed) or self._video_done
+
+    @property
     def latest_frame(self) -> av.VideoFrame | None:
         with self._cond:
             return self._latest_frame
@@ -255,6 +264,16 @@ class ScrcpySession:
             with self._cond:
                 self._video_done = True
                 self._cond.notify_all()
+            self._notify_disconnect()
+
+    def _notify_disconnect(self) -> None:
+        if self._closed or self._on_disconnect is None:
+            return
+        with self._disconnect_lock:
+            if self._disconnect_notified:
+                return
+            self._disconnect_notified = True
+        self._on_disconnect()
 
     def _publish(self, frame: av.VideoFrame) -> None:
         with self._cond:

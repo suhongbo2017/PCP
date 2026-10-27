@@ -56,8 +56,9 @@ class _Bridge(QObject):
     """Carries results from worker threads to the GUI thread (queued signals)."""
 
     connected = Signal(object)  # ScrcpySession
-    connect_failed = Signal(str)
+    connect_failed = Signal(object, str)
     disconnected = Signal()
+    device_lost = Signal(object, str)
     message = Signal(str)
     script_log = Signal(str)
     script_done = Signal(object, str)
@@ -232,6 +233,8 @@ class MainWindow(QMainWindow):
         self._sessions: dict[str, ScrcpySession] = {}
         self._active_serial: str | None = None
         self._connecting = False
+        self._connect_generation = 0
+        self._connect_cancel: threading.Event | None = None
         self._last_frame = None
         self._shown_size: tuple[int, int] | None = None
         self._view_key: tuple | None = None
@@ -246,6 +249,7 @@ class MainWindow(QMainWindow):
         self._bridge.connected.connect(self._on_connected)
         self._bridge.connect_failed.connect(self._on_connect_failed)
         self._bridge.disconnected.connect(self._on_disconnected)
+        self._bridge.device_lost.connect(self._on_device_lost)
         self._bridge.message.connect(self.set_status)
         self._bridge.script_log.connect(self._append_script_log)
         self._bridge.script_done.connect(self._on_script_done)
@@ -599,12 +603,10 @@ class MainWindow(QMainWindow):
         serials = self.selected_serials()
         if not serials or self._connecting:
             return
-        devices = {d.serial: d for d in self._adb.devices()}
-        invalid = [s for s in serials if s not in devices or not devices[s].ready]
-        if invalid:
-            self.set_status(f"设备未就绪：{', '.join(invalid)}")
-            return
-
+        self._connect_generation += 1
+        generation = self._connect_generation
+        cancel = threading.Event()
+        self._connect_cancel = cancel
         max_size = QUALITY_CHOICES[self.quality_box.currentIndex()][1]
         mode = self.video_mode_box.currentData()
         max_fps = self.max_fps_box.value()
@@ -616,7 +618,13 @@ class MainWindow(QMainWindow):
         def work() -> None:
             sessions = []
             try:
+                devices = {d.serial: d for d in self._adb.devices()}
+                invalid = [s for s in serials if s not in devices or not devices[s].ready]
+                if invalid:
+                    raise ScrcpyError(f"设备未就绪：{', '.join(invalid)}")
                 for serial in serials:
+                    if cancel.is_set():
+                        break
                     video = mode == "all" or (mode == "primary" and serial == serials[0])
                     options = ServerOptions(
                         video=video,
@@ -624,24 +632,42 @@ class MainWindow(QMainWindow):
                         max_fps=max_fps,
                         video_bit_rate=bit_rate,
                     )
-                    session = ScrcpySession(serial, adb=self._adb, options=options)
+                    session = ScrcpySession(
+                        serial,
+                        adb=self._adb,
+                        options=options,
+                        on_disconnect=lambda s=serial, g=generation: self._bridge.device_lost.emit(g, s),
+                    )
                     session.start()
+                    sessions.append(session)
+                    if cancel.is_set():
+                        session.close()
+                        break
                     if video:
                         session.wait_screen_size(timeout=15)
                     elif session.screen_size is None:
                         raise ScrcpyError(f"{serial}: 无法通过 ADB 获取屏幕尺寸")
-                    sessions.append(session)
+                if cancel.is_set():
+                    for session in sessions:
+                        session.close()
+                    return
             except (ScrcpyError, AdbError, OSError) as exc:
                 for session in sessions:
                     session.close()
-                self._bridge.connect_failed.emit(str(exc))
+                self._bridge.connect_failed.emit(generation, str(exc))
                 return
-            self._bridge.connected.emit(sessions)
+            self._bridge.connected.emit((generation, sessions))
 
         threading.Thread(target=work, name="connect", daemon=True).start()
 
-    def _on_connected(self, sessions: list[ScrcpySession]) -> None:
+    def _on_connected(self, result) -> None:
+        generation, sessions = result
+        if generation != self._connect_generation:
+            for session in sessions:
+                session.close()
+            return
         self._connecting = False
+        self._connect_cancel = None
         self._sessions = {session.serial: session for session in sessions}
         self._session = _SessionGroup(sessions)
         self._last_frame = None
@@ -675,17 +701,31 @@ class MainWindow(QMainWindow):
         if self.auto_page_checkbox.isChecked():
             self._set_auto_page(True)
 
-    def _on_connect_failed(self, message: str) -> None:
+    def _on_connect_failed(self, generation: int, message: str) -> None:
+        if generation != self._connect_generation:
+            return
         self._connecting = False
+        self._connect_cancel = None
         self._update_buttons()
         self._update_automation_buttons()
         self.set_status("连接失败")
         QMessageBox.warning(self, "连接失败", message)
 
     def disconnect_device(self) -> None:
+        if self._connecting:
+            self._connect_generation += 1
+            if self._connect_cancel is not None:
+                self._connect_cancel.set()
+            self._connecting = False
+            self._connect_cancel = None
+            self.set_status("正在取消连接…")
+            self._update_buttons()
+            self._update_automation_buttons()
+            return
         group = self._session
         if group is None:
             return
+        self._connect_generation += 1
         self._session = None
         self._sessions = {}
         self._active_serial = None
@@ -712,6 +752,43 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         self._update_automation_buttons()
 
+    def _on_device_lost(self, generation: int, serial: str) -> None:
+        if generation != self._connect_generation or self._session is None:
+            return
+        if serial not in self._sessions:
+            return
+        if self._recorder is not None:
+            self._recorder.stop()
+            self._recorder = None
+        self._session._recorder = None
+        self._connect_generation += 1
+        group = self._session
+        self._session = None
+        self._sessions = {}
+        self._active_serial = None
+        self._page_timer.stop()
+        self._set_sync_enabled(False)
+        for view in self._views.values():
+            view.attach(None)
+            view.clear_image()
+        self._views.clear()
+        self._view_grid.addWidget(self.view, 0, 0)
+        self.setWindowTitle("phonectl")
+        self.fps_label.setText("")
+        self.size_label.setText("")
+        self.set_status(f"设备 {serial} 网络/控制连接已断开，正在清理会话…")
+        self._update_buttons()
+        self._update_automation_buttons()
+
+        def work() -> None:
+            try:
+                group.close()
+            finally:
+                self._bridge.message.emit(f"设备 {serial} 已断开，请检查网络后重连")
+                self._bridge.disconnected.emit()
+
+        threading.Thread(target=work, name="device-lost-cleanup", daemon=True).start()
+
     def _update_buttons(self) -> None:
         connected = self._session is not None
         self.connect_btn.setText("断开全部" if connected else "连接选中")
@@ -733,6 +810,10 @@ class MainWindow(QMainWindow):
     def _tick(self) -> None:
         session = self._session
         if session is None:
+            return
+        lost = next((s.serial for s in session.sessions if s.disconnected), None)
+        if lost is not None:
+            self._on_device_lost(self._connect_generation, lost)
             return
         frames = []
         for serial, view in self._views.items():

@@ -23,9 +23,11 @@ class ControlChannel:
         sock: socket.socket,
         *,
         on_clipboard: Callable[[str], None] | None = None,
+        on_disconnect: Callable[[], None] | None = None,
     ) -> None:
         self._sock = sock
         self._on_clipboard = on_clipboard
+        self._on_disconnect = on_disconnect
         self._send_lock = threading.Lock()
         self._cond = threading.Condition()
         self._acks: set[int] = set()
@@ -118,5 +120,8 @@ class ControlChannel:
                 log.warning("control reader stopped: %s", exc)
         finally:
             with self._cond:
+                was_closed = self._closed
                 self._closed = True
                 self._cond.notify_all()
+            if not was_closed and self._on_disconnect:
+                self._on_disconnect()
