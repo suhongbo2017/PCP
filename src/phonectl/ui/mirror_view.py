@@ -21,6 +21,7 @@ class MirrorView(QWidget):
     controller receives the events. Without a session, input is ignored.
     """
 
+    activated = Signal()
     paste_requested = Signal()  # Ctrl+V: main window copies the PC clipboard to the phone
     unicode_typed = Signal(str)  # non-ASCII text cannot be injected as text (see docs)
 
@@ -92,7 +93,12 @@ class MirrorView(QWidget):
 
     # ---- mouse -----------------------------------------------------------
 
+    def focusInEvent(self, event) -> None:
+        self.activated.emit()
+        super().focusInEvent(event)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        self.activated.emit()
         self.setFocus()
         ctl = self._controller()
         if ctl is None:

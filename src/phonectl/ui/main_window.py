@@ -10,6 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QFileDialog,
@@ -84,21 +85,73 @@ class _BroadcastController:
 
 
 class _SessionView:
-    def __init__(self, session: ScrcpySession, controller) -> None:
+    def __init__(self, session: ScrcpySession, group: _SessionGroup) -> None:
         self._session = session
-        self.controller = controller
+        self._group = group
+        self.controller = _ViewController(session, group)
 
     @property
     def screen_size(self):
         return self._session.screen_size
 
 
+class _ViewController:
+    def __init__(self, session: ScrcpySession, group: _SessionGroup) -> None:
+        self._session = session
+        self._group = group
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            coordinate_actions = {"touch_down", "touch_move", "touch_up", "scroll"}
+            if not self._group.sync_enabled:
+                return getattr(self._session.controller, name)(*args, **kwargs)
+            targets = self._group.sessions if name in coordinate_actions else []
+            if not targets:
+                return getattr(self._group.broadcast_controller, name)(*args, **kwargs)
+            source_size = self._session.screen_size
+            if source_size is None:
+                return getattr(self._session.controller, name)(*args, **kwargs)
+            results = []
+            errors = []
+            for target in targets:
+                try:
+                    target_size = target.screen_size
+                    mapped = args
+                    if target is not self._session and target_size is not None and len(args) >= 2:
+                        sx = target_size[0] / source_size[0]
+                        sy = target_size[1] / source_size[1]
+                        mapped = (round(args[0] * sx), round(args[1] * sy), *args[2:])
+                    results.append(getattr(target.controller, name)(*mapped, **kwargs))
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise ControlError("; ".join(errors))
+            return next((value for value in results if value is not None), None)
+        return call
+
+
 class _SessionGroup:
     def __init__(self, sessions: list[ScrcpySession]) -> None:
         self.sessions = sessions
+        self.sync_enabled = False
+        self.active_serial = sessions[0].serial
         self.primary = sessions[0]
         self.serial = ",".join(s.serial for s in sessions)
-        self.controller = _BroadcastController(sessions)
+        self.controllers = {s.serial: s.controller for s in sessions if s.controller is not None}
+        self.broadcast_controller = _BroadcastController(sessions)
+        self._controller_override = None
+
+    @property
+    def controller(self):
+        if self._controller_override is not None:
+            return self._controller_override
+        if self.sync_enabled:
+            return self.broadcast_controller
+        return self.controllers.get(self.active_serial, self.controllers[self.primary.serial])
+
+    @controller.setter
+    def controller(self, value):
+        self._controller_override = value
 
     @property
     def latest_frame(self):
@@ -131,6 +184,7 @@ class MainWindow(QMainWindow):
         self._adb = Adb()
         self._session: _SessionGroup | None = None
         self._sessions: dict[str, ScrcpySession] = {}
+        self._active_serial: str | None = None
         self._connecting = False
         self._last_frame = None
         self._shown_size: tuple[int, int] | None = None
@@ -187,6 +241,11 @@ class MainWindow(QMainWindow):
         top_row.addWidget(QLabel("清晰度"))
         top_row.addWidget(self.quality_box)
         top_row.addWidget(self.connect_btn)
+        self.sync_checkbox = QCheckBox("同步操作")
+        self.sync_checkbox.setToolTip("关闭时仅操作当前选中的设备；打开时将工具栏、键盘和脚本操作广播到全部设备")
+        self.sync_checkbox.setChecked(False)
+        self.sync_checkbox.toggled.connect(self._set_sync_enabled)
+        top_row.addWidget(self.sync_checkbox)
 
         self.view = MirrorView()
         self._views: dict[str, MirrorView] = {}
@@ -215,6 +274,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_label, 1)
 
     def _connect_view_signals(self, view: MirrorView) -> None:
+        view.activated.connect(lambda v=view: self._activate_view(v))
         view.paste_requested.connect(self.paste_pc_clipboard)
         view.unicode_typed.connect(self._on_unicode_typed)
 
@@ -474,15 +534,16 @@ class MainWindow(QMainWindow):
             view = self.view if index == 0 else MirrorView()
             if index:
                 self._connect_view_signals(view)
-            view.attach(_SessionView(device_session, self._session.controller))
+            view.attach(_SessionView(device_session, self._session))
             row, col = divmod(index, columns)
             self._view_grid.addWidget(view, row, col)
             self._views[device_session.serial] = view
+        self._active_serial = sessions[0].serial
         self.view.setFocus()
         self.setWindowTitle(f"phonectl - {len(sessions)} 台设备")
         if len(sessions) > 1:
             self.resize(max(self.width(), 1100), max(self.height(), 900))
-        self.set_status(f"已连接 {len(sessions)} 台设备，操作将广播")
+        self.set_status(f"已连接 {len(sessions)} 台设备，当前设备：{sessions[0].info.device_name}；同步操作关闭")
         self._update_buttons()
         self._update_automation_buttons()
 
@@ -499,6 +560,7 @@ class MainWindow(QMainWindow):
             return
         self._session = None
         self._sessions = {}
+        self._active_serial = None
         for view in self._views.values():
             view.attach(None)
         self._views.clear()
@@ -566,12 +628,41 @@ class MainWindow(QMainWindow):
 
     # ---- actions ---------------------------------------------------------
 
+    def _set_sync_enabled(self, enabled: bool) -> None:
+        if self._session is not None:
+            self._session.sync_enabled = enabled
+            self._session._controller_override = None
+        mode = "已开启，同步到全部设备" if enabled else "已关闭，仅操作当前设备"
+        self.set_status(f"同步操作{mode}")
+
+    def _activate_view(self, view: MirrorView) -> None:
+        for serial, candidate in self._views.items():
+            if candidate is view:
+                self._active_serial = serial
+                if self._session is not None:
+                    self._session.active_serial = serial
+                session = self._sessions.get(serial)
+                if session is not None:
+                    self.set_status(f"当前设备：{session.info.device_name}")
+                return
+
+    def _target_controller(self):
+        if self._session is None:
+            return None
+        if self.sync_checkbox.isChecked():
+            return getattr(self._session, "broadcast_controller", self._session.controller)
+        controllers = getattr(self._session, "controllers", None)
+        if controllers is None:
+            return self._session.controller
+        return controllers.get(self._active_serial or "", self._session.controller)
+
     def _send(self, action) -> None:
-        if self._session is None or self._session.controller is None:
-            self.set_status("未连接")
+        controller = self._target_controller()
+        if controller is None:
+            self.set_status("未连接或未选择设备")
             return
         try:
-            action(self._session.controller)
+            action(controller)
         except ControlError as exc:
             self.set_status(f"发送失败：{exc}")
 
@@ -586,21 +677,23 @@ class MainWindow(QMainWindow):
         self.set_status(f"已保存截图：{path}")
 
     def paste_pc_clipboard(self) -> None:
-        if self._session is None or self._session.controller is None:
-            self.set_status("未连接")
+        controller = self._target_controller()
+        if controller is None:
+            self.set_status("未连接或未选择设备")
             return
         text = QGuiApplication.clipboard().text()
         if not text:
             self.set_status("电脑剪贴板为空")
             return
-        ok = self._session.controller.set_clipboard(text)
-        self.set_status("已同步到手机剪贴板（长按输入框即可粘贴）" if ok else "手机未确认剪贴板写入")
+        ok = controller.set_clipboard(text)
+        self.set_status("已发送到目标设备剪贴板（长按输入框即可粘贴）" if ok else "手机未确认剪贴板写入")
 
     def fetch_phone_clipboard(self) -> None:
-        if self._session is None or self._session.controller is None:
-            self.set_status("未连接")
+        controller = self._target_controller()
+        if controller is None:
+            self.set_status("未连接或未选择设备")
             return
-        text = self._session.controller.get_clipboard(timeout=2.0)
+        text = controller.get_clipboard(timeout=2.0)
         if text is None:
             self.set_status("没有收到手机剪贴板内容")
             return
@@ -609,9 +702,10 @@ class MainWindow(QMainWindow):
 
     def _on_unicode_typed(self, text: str) -> None:
         # INJECT_TEXT cannot type CJK characters, so put them on the phone clipboard instead.
-        if self._session is None or self._session.controller is None:
+        controller = self._target_controller()
+        if controller is None:
             return
-        ok = self._session.controller.set_clipboard(text)
+        ok = controller.set_clipboard(text)
         self.set_status(
             "中文已放入手机剪贴板：长按输入框选择“粘贴”" if ok else "手机未确认剪贴板写入"
         )
