@@ -169,6 +169,36 @@ class _SessionGroup:
     def wait_frame(self, timeout=10):
         return self.primary.wait_frame(timeout)
 
+    def page_video(self, direction: int, *, sync: bool) -> None:
+        source = self.controllers.get(self.active_serial, self.controllers[self.primary.serial])
+        source_size = next(
+            (session.screen_size for session in self.sessions if session.serial == self.active_serial),
+            self.primary.screen_size,
+        )
+        if source_size is None:
+            raise ControlError("设备屏幕尺寸尚未就绪")
+        targets = self.sessions if sync else [self.primary if self.active_serial == self.primary.serial else next(
+            session for session in self.sessions if session.serial == self.active_serial
+        )]
+        errors = []
+        for target in targets:
+            size = target.screen_size
+            if size is None:
+                errors.append(f"{target.serial}: 屏幕尺寸尚未就绪")
+                continue
+            width, height = size
+            center_x = width // 2
+            center_y = height // 2
+            delta = round(height * 0.325) * direction
+            try:
+                target.controller.swipe(
+                    center_x, center_y + delta, center_x, center_y - delta, duration=0.25
+                )
+            except Exception as exc:
+                errors.append(f"{target.serial}: {exc}")
+        if errors:
+            raise ControlError("; ".join(errors))
+
     def close(self):
         for session in self.sessions:
             session.close()
@@ -388,10 +418,22 @@ class MainWindow(QMainWindow):
                 self.set_status("自动翻页已关闭")
 
     def next_video(self) -> None:
-        self._send(lambda c: c.swipe_up(distance=0.65, duration=0.25))
+        if self._session is None:
+            self.set_status("未连接")
+            return
+        try:
+            self._session.page_video(1, sync=self.sync_checkbox.isChecked())
+        except ControlError as exc:
+            self.set_status(f"翻页失败：{exc}")
 
     def previous_video(self) -> None:
-        self._send(lambda c: c.swipe_down(distance=0.65, duration=0.25))
+        if self._session is None:
+            self.set_status("未连接")
+            return
+        try:
+            self._session.page_video(-1, sync=self.sync_checkbox.isChecked())
+        except ControlError as exc:
+            self.set_status(f"翻页失败：{exc}")
 
     def choose_script(self) -> None:
         if self._session is None:

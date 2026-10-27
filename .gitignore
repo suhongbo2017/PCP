@@ -7,6 +7,7 @@ build/
 dist/
 dist-updated/
 dist-video/
+dist-video-fixed/
 
 # Runtime output and local automation data
 screenshots/
