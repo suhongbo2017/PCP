@@ -39,4 +39,11 @@ def test_handshake_and_packets_over_socketpair():
 def test_server_options_args():
     args = ServerOptions(max_size=1024, max_fps=30).to_args()
     assert "max_size=1024" in args and "max_fps=30" in args
+    assert "video=true" in args
     assert "audio=false" in args and "control=true" in args
+
+
+def test_server_options_can_disable_video():
+    args = ServerOptions(video=False, video_bit_rate=2_000_000).to_args()
+    assert "video=false" in args
+    assert "video_bit_rate=2000000" in args

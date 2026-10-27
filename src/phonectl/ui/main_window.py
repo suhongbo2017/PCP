@@ -278,6 +278,19 @@ class MainWindow(QMainWindow):
         for label, _ in QUALITY_CHOICES:
             self.quality_box.addItem(label)
         self.quality_box.setCurrentIndex(2)  # 1280
+        self.video_mode_box = QComboBox()
+        self.video_mode_box.addItem("全部显示", "all")
+        self.video_mode_box.addItem("主设备显示", "primary")
+        self.video_mode_box.addItem("仅控制", "control")
+        self.video_mode_box.setToolTip("选择视频流模式，减少多设备连接时的网络与解码开销")
+        self.max_fps_box = QSpinBox()
+        self.max_fps_box.setRange(5, 60)
+        self.max_fps_box.setValue(30)
+        self.max_fps_box.setSuffix(" fps")
+        self.bit_rate_box = QComboBox()
+        for label, rate in (("2 Mbps", 2_000_000), ("4 Mbps", 4_000_000), ("6 Mbps", 6_000_000), ("8 Mbps", 8_000_000)):
+            self.bit_rate_box.addItem(label, rate)
+        self.bit_rate_box.setCurrentIndex(1)
         self.connect_btn = QPushButton("连接")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
 
@@ -287,6 +300,9 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.wifi_btn)
         top_row.addWidget(QLabel("清晰度"))
         top_row.addWidget(self.quality_box)
+        top_row.addWidget(self.video_mode_box)
+        top_row.addWidget(self.max_fps_box)
+        top_row.addWidget(self.bit_rate_box)
         top_row.addWidget(self.connect_btn)
         self.sync_checkbox = QCheckBox("同步操作")
         self.sync_checkbox.setToolTip("关闭时仅操作当前选中的设备；打开时将工具栏、键盘和脚本操作广播到全部设备")
@@ -590,6 +606,9 @@ class MainWindow(QMainWindow):
             return
 
         max_size = QUALITY_CHOICES[self.quality_box.currentIndex()][1]
+        mode = self.video_mode_box.currentData()
+        max_fps = self.max_fps_box.value()
+        bit_rate = self.bit_rate_box.currentData()
         self._connecting = True
         self.set_status("正在连接…")
         self._update_buttons()
@@ -598,9 +617,19 @@ class MainWindow(QMainWindow):
             sessions = []
             try:
                 for serial in serials:
-                    session = ScrcpySession(serial, adb=self._adb, options=ServerOptions(max_size=max_size))
+                    video = mode == "all" or (mode == "primary" and serial == serials[0])
+                    options = ServerOptions(
+                        video=video,
+                        max_size=max_size,
+                        max_fps=max_fps,
+                        video_bit_rate=bit_rate,
+                    )
+                    session = ScrcpySession(serial, adb=self._adb, options=options)
                     session.start()
-                    session.wait_screen_size(timeout=15)
+                    if video:
+                        session.wait_screen_size(timeout=15)
+                    elif session.screen_size is None:
+                        raise ScrcpyError(f"{serial}: 无法通过 ADB 获取屏幕尺寸")
                     sessions.append(session)
             except (ScrcpyError, AdbError, OSError) as exc:
                 for session in sessions:
@@ -629,11 +658,14 @@ class MainWindow(QMainWindow):
             if index:
                 self._connect_view_signals(view)
             view.attach(_SessionView(device_session, self._session))
+            view.setVisible(device_session.options.video)
             row, col = divmod(index, columns)
             self._view_grid.addWidget(view, row, col)
             self._views[device_session.serial] = view
         self._active_serial = sessions[0].serial
         self.view.setFocus()
+        if not any(session.options.video for session in sessions):
+            self.set_status("已连接，仅控制模式：视频流已关闭")
         self.setWindowTitle(f"phonectl - {len(sessions)} 台设备")
         if len(sessions) > 1:
             self.resize(max(self.width(), 1100), max(self.height(), 900))
@@ -688,6 +720,9 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(not connected and not self._connecting)
         self.wifi_btn.setEnabled(not connected and not self._connecting)
         self.quality_box.setEnabled(not connected and not self._connecting)
+        self.video_mode_box.setEnabled(not connected and not self._connecting)
+        self.max_fps_box.setEnabled(not connected and not self._connecting)
+        self.bit_rate_box.setEnabled(not connected and not self._connecting)
         for btn in self._control_buttons:
             btn.setEnabled(connected)
         self.auto_page_checkbox.setEnabled(connected)

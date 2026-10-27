@@ -44,6 +44,7 @@ class ScrcpyError(RuntimeError):
 @dataclass
 class ServerOptions:
     video_codec: str = "h264"
+    video: bool = True
     max_size: int = 0  # 0 = no limit
     max_fps: int = 0  # 0 = no limit
     video_bit_rate: int = 8_000_000
@@ -52,6 +53,7 @@ class ServerOptions:
 
     def to_args(self) -> list[str]:
         args = [
+            f"video={str(self.video).lower()}",
             f"video_codec={self.video_codec}",
             f"video_bit_rate={self.video_bit_rate}",
             "audio=false",
@@ -148,11 +150,15 @@ class ScrcpySession:
         self._proc = self.adb.shell_popen(self.serial, command)
         threading.Thread(target=self._pump_server_output, name="server-log", daemon=True).start()
 
-        # Video socket first: it carries the device name and codec id.
-        self._video_sock = self._accept()
-        self._video_stream = VideoStream(self._video_sock, device_meta=True)
-        self.info = self._video_stream.handshake()
-        log.info("video connected: device=%r codec=%s", self.info.device_name, self.info.codec)
+        if self.options.video:
+            # Video socket first: it carries the device name and codec id.
+            self._video_sock = self._accept()
+            self._video_stream = VideoStream(self._video_sock, device_meta=True)
+            self.info = self._video_stream.handshake()
+            log.info("video connected: device=%r codec=%s", self.info.device_name, self.info.codec)
+        else:
+            self.info = StreamInfo(device_name=self.serial, codec="")
+            self._screen_size = self.adb.display_size(self.serial)
 
         self._control_sock = self._accept()
         self.control = ControlChannel(self._control_sock)
@@ -163,7 +169,8 @@ class ScrcpySession:
         self._listener.close()
         self._listener = None
 
-        threading.Thread(target=self._video_loop, name="video-decoder", daemon=True).start()
+        if self.options.video:
+            threading.Thread(target=self._video_loop, name="video-decoder", daemon=True).start()
 
     def close(self) -> None:
         if self._closed:

@@ -17,6 +17,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 DEFAULT_TCP_PORT = 5555
 _INET_RE = re.compile(r"inet (\d{1,3}(?:\.\d{1,3}){3})/\d+")
+_SIZE_RE = re.compile(r"(?:Physical size|Override size):\s*(\d+)x(\d+)")
 
 
 class AdbError(RuntimeError):
@@ -158,6 +159,14 @@ class Adb:
         )
 
     # ---- wireless --------------------------------------------------------
+
+    def display_size(self, serial: str) -> tuple[int, int] | None:
+        output = self.run(["shell", "wm", "size"], serial=serial)
+        matches = _SIZE_RE.findall(output)
+        if not matches:
+            return None
+        width, height = matches[-1]
+        return int(width), int(height)
 
     def wlan_ip(self, serial: str) -> str | None:
         """Phone's Wi-Fi IPv4 address (works over USB or an existing wireless connection)."""
