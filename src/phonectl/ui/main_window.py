@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QMainWindow,
     QListWidget,
@@ -82,6 +83,16 @@ class _BroadcastController:
         return call
 
 
+class _SessionView:
+    def __init__(self, session: ScrcpySession, controller) -> None:
+        self._session = session
+        self.controller = controller
+
+    @property
+    def screen_size(self):
+        return self._session.screen_size
+
+
 class _SessionGroup:
     def __init__(self, sessions: list[ScrcpySession]) -> None:
         self.sessions = sessions
@@ -119,6 +130,7 @@ class MainWindow(QMainWindow):
 
         self._adb = Adb()
         self._session: _SessionGroup | None = None
+        self._sessions: dict[str, ScrcpySession] = {}
         self._connecting = False
         self._last_frame = None
         self._shown_size: tuple[int, int] | None = None
@@ -177,14 +189,19 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.connect_btn)
 
         self.view = MirrorView()
-        self.view.paste_requested.connect(self.paste_pc_clipboard)
-        self.view.unicode_typed.connect(self._on_unicode_typed)
+        self._views: dict[str, MirrorView] = {}
+        self._view_grid = QGridLayout()
+        self._view_grid.setContentsMargins(0, 0, 0, 0)
+        self._view_grid.addWidget(self.view, 0, 0)
+        self._connect_view_signals(self.view)
 
+        self._view_container = QWidget()
+        self._view_container.setLayout(self._view_grid)
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(top)
-        layout.addWidget(self.view, 1)
+        layout.addWidget(self._view_container, 1)
         self.setCentralWidget(central)
 
         self._build_side_toolbar()
@@ -196,6 +213,10 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.size_label)
         self.statusBar().addPermanentWidget(self.fps_label)
         self.statusBar().addWidget(self.status_label, 1)
+
+    def _connect_view_signals(self, view: MirrorView) -> None:
+        view.paste_requested.connect(self.paste_pc_clipboard)
+        view.unicode_typed.connect(self._on_unicode_typed)
 
     def _build_side_toolbar(self) -> None:
         bar = QToolBar("控制")
@@ -438,12 +459,29 @@ class MainWindow(QMainWindow):
 
     def _on_connected(self, sessions: list[ScrcpySession]) -> None:
         self._connecting = False
+        self._sessions = {session.serial: session for session in sessions}
         self._session = _SessionGroup(sessions)
         self._last_frame = None
         self._shown_size = None
-        self.view.attach(self._session)
+        while self._view_grid.count():
+            item = self._view_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None and widget is not self.view:
+                widget.setParent(None)
+        self._views = {}
+        columns = 1 if len(sessions) == 1 else 2
+        for index, device_session in enumerate(sessions):
+            view = self.view if index == 0 else MirrorView()
+            if index:
+                self._connect_view_signals(view)
+            view.attach(_SessionView(device_session, self._session.controller))
+            row, col = divmod(index, columns)
+            self._view_grid.addWidget(view, row, col)
+            self._views[device_session.serial] = view
         self.view.setFocus()
         self.setWindowTitle(f"phonectl - {len(sessions)} 台设备")
+        if len(sessions) > 1:
+            self.resize(max(self.width(), 1100), max(self.height(), 900))
         self.set_status(f"已连接 {len(sessions)} 台设备，操作将广播")
         self._update_buttons()
         self._update_automation_buttons()
@@ -460,7 +498,11 @@ class MainWindow(QMainWindow):
         if group is None:
             return
         self._session = None
-        self.view.attach(None)
+        self._sessions = {}
+        for view in self._views.values():
+            view.attach(None)
+        self._views.clear()
+        self._view_grid.addWidget(self.view, 0, 0)
         self.setWindowTitle("phonectl")
         self.fps_label.setText("")
         self.size_label.setText("")
@@ -496,25 +538,24 @@ class MainWindow(QMainWindow):
         session = self._session
         if session is None:
             return
-        frame = session.latest_frame
-        if frame is None:
+        frames = []
+        for serial, view in self._views.items():
+            device_session = self._sessions.get(serial)
+            frame = device_session.latest_frame if device_session is not None else None
+            if frame is None:
+                continue
+            frames.append(frame)
+            w, h = view.physical_size_for(frame.width, frame.height)
+            image: QImage = frame_to_qimage(frame, w, h)
+            image.setDevicePixelRatio(view.devicePixelRatioF())
+            view.set_image(image)
+        if not frames:
             return
-
-        size_changed = (frame.width, frame.height) != self._shown_size
-        view_key = (self.view.width(), self.view.height(), self.view.devicePixelRatioF())
-        if frame is self._last_frame and not size_changed and view_key == self._view_key:
-            return
-
+        frame = frames[0]
         if frame is not self._last_frame:
             self._fps_frames += 1
-        self._last_frame = frame
-        self._view_key = view_key
+            self._last_frame = frame
         self._shown_size = (frame.width, frame.height)
-
-        w, h = self.view.physical_size_for(frame.width, frame.height)
-        image: QImage = frame_to_qimage(frame, w, h)
-        image.setDevicePixelRatio(self.view.devicePixelRatioF())
-        self.view.set_image(image)
 
         now = time.monotonic()
         if now - self._fps_since >= 1.0:
